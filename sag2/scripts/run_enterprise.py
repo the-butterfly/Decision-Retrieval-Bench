@@ -262,6 +262,7 @@ def main():
     # not the process, and this runner drives one event loop per worker thread, so the
     # budget must be thread-safe (a threading.Lock, never held across an await).
     limits = MODEL_LIMITS.get(MODEL, DEFAULT_LIMITS)
+    budget = None  # only used by the single-key path; the KeyRing owns pacing otherwise
     if _VLLM:
         keys = [
             k
