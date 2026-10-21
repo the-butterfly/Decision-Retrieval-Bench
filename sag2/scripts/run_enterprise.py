@@ -265,9 +265,16 @@ def main():
     if _VLLM:
         keys = [
             k
-            for k in (api_key, os.getenv("VLLM_SR_KEY2"), os.getenv("VLLM_SR_KEY3"))
+            for k in (
+                api_key,
+                env.get("VLLM_SR_KEY2"),
+                env.get("VLLM_SR_KEY3"),
+                os.getenv("VLLM_SR_KEY2"),
+                os.getenv("VLLM_SR_KEY3"),
+            )
             if k
         ]
+        keys = list(dict.fromkeys(keys))  # preserve order, drop duplicates
         keyring = KeyRing(
             keys,
             float(os.getenv("VLLM_SR_TOKENS_PER_MIN", limits["tokens_per_minute"])),
