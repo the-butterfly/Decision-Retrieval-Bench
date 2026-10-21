@@ -20,10 +20,19 @@ from dotenv import dotenv_values
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 from enterprise_index import ReadOnlyIndex, save  # noqa: E402
-from sag2 import JevClient, corpus_fingerprint, search_sag2  # noqa: E402
+from sag2 import corpus_fingerprint, search_sag2  # noqa: E402
+from sag2_vllm import (  # noqa: E402
+    DEFAULT_LIMITS,
+    MODEL_LIMITS,
+    KeyRing,
+    TokenBudget,
+    VllmSrJevClient,
+)
 
-ENDPOINT = "https://openrouter.ai/api/alpha/decisions"
-MODEL = "typesafe/jev-1.13"
+# EXP-02: route to vLLM-SR (d3-turbo) when VLLM_SR_API is set; else fall back to JEV/OpenRouter.
+_VLLM = os.getenv("VLLM_SR_API")
+ENDPOINT = (_VLLM.rstrip("/") + "/systemone") if _VLLM else "https://openrouter.ai/api/alpha/decisions"
+MODEL = (os.getenv("VLLM_SR_MODEL") or "vllm-sr/d3-turbo") if _VLLM else "typesafe/jev-1.13"
 PARAMETERS = {"candidate_k": 100, "seed_k": 10, "max_hops": 2, "expansion_term_limit": 20}
 KS = (1, 2, 5, 10)
 
@@ -60,9 +69,29 @@ def aggregate(questions, results, failures):
     return report
 
 
-class RecordedJev(JevClient):
-    def __init__(self, api_key, directory, activity):
-        super().__init__(None, ENDPOINT, MODEL, api_key)
+class RecordedJev(VllmSrJevClient):
+    def __init__(
+        self,
+        api_key,
+        directory,
+        activity,
+        budget=None,
+        keyring=None,
+        state_chars=None,
+        state_mode="full",
+        max_questions_per_request=None,
+    ):
+        super().__init__(
+            None,
+            ENDPOINT,
+            MODEL,
+            api_key,
+            budget=budget,
+            keyring=keyring,
+            state_chars=state_chars,
+            state_mode=state_mode,
+            max_questions_per_request=max_questions_per_request,
+        )
         self.directory, self.activity = directory, activity
         self.request_lock = asyncio.Lock()
         self.round = 0
@@ -132,7 +161,10 @@ class RecordedJev(JevClient):
             return response
 
 
-def run_question(question, build, shared, api_key, activity, output):
+def run_question(
+    question, build, shared, api_key, activity, output, budget=None, keyring=None,
+    state_chars=None, state_mode="full", maxq=None
+):
     index = ReadOnlyIndex(
         Path(build["index_path"]),
         build["index_signature"],
@@ -142,7 +174,10 @@ def run_question(question, build, shared, api_key, activity, output):
     )
 
     async def execute():
-        client = RecordedJev(api_key, output / "requests" / question["question_id"], activity)
+        client = RecordedJev(
+            api_key, output / "requests" / question["question_id"], activity,
+            budget=budget, keyring=keyring, state_chars=state_chars, state_mode=state_mode, max_questions_per_request=maxq,
+        )
         trace = aiohttp.TraceConfig()
         trace.on_request_start.append(client.request_started)
         trace.on_request_end.append(client.request_finished)
@@ -192,6 +227,12 @@ def main():
         "--index-summary", type=Path, default=ROOT / "output/enterprise/index/summary.json"
     )
     parser.add_argument("--output-dir", type=Path, default=ROOT / "output/enterprise/evaluation")
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Evaluate only the first N eligible questions (sample runs)",
+    )
     args = parser.parse_args()
     if not 1 <= args.concurrency <= 20:
         parser.error("Concurrency must be between 1 and 20")
@@ -200,28 +241,78 @@ def main():
     assert len(questions) == 500 and len({q["question_id"] for q in questions}) == 500
     eligible = [q for q in questions if q["expected_doc_ids"]]
     assert len(eligible) == 470
+    if args.limit is not None:
+        eligible = eligible[: args.limit]
     build = json.loads(args.index_summary.read_text())
     env = dotenv_values(args.env_file)
-    api_key = (
-        env.get("OPENROUTER_API_KEY")
-        or env.get("JEV_API_KEY")
-        or os.getenv("OPENROUTER_API_KEY")
-        or os.getenv("JEV_API_KEY")
-    )
-    if not api_key:
-        raise ValueError("OpenRouter API key is missing")
+    if _VLLM:
+        api_key = env.get("VLLM_SR_KEY") or os.getenv("VLLM_SR_KEY")
+        if not api_key:
+            raise ValueError("VLLM_SR_KEY is missing (EXP-02 vLLM-SR routing)")
+    else:
+        api_key = (
+            env.get("OPENROUTER_API_KEY")
+            or env.get("JEV_API_KEY")
+            or os.getenv("OPENROUTER_API_KEY")
+            or os.getenv("JEV_API_KEY")
+        )
+        if not api_key:
+            raise ValueError("OpenRouter API key is missing")
+    # EXP-02: ONE shared token budget for the whole run. The provider meters the key,
+    # not the process, and this runner drives one event loop per worker thread, so the
+    # budget must be thread-safe (a threading.Lock, never held across an await).
+    limits = MODEL_LIMITS.get(MODEL, DEFAULT_LIMITS)
+    if _VLLM:
+        keys = [
+            k
+            for k in (api_key, os.getenv("VLLM_SR_KEY2"), os.getenv("VLLM_SR_KEY3"))
+            if k
+        ]
+        keyring = KeyRing(
+            keys,
+            float(os.getenv("VLLM_SR_TOKENS_PER_MIN", limits["tokens_per_minute"])),
+            float(os.getenv("VLLM_SR_REQUESTS_PER_MIN", limits["requests_per_minute"])),
+            aggregate_tokens_per_minute=(
+                float(os.environ["VLLM_SR_AGGREGATE_TOKENS_PER_MIN"])
+                if os.getenv("VLLM_SR_AGGREGATE_TOKENS_PER_MIN")
+                else None
+            ),
+            safety=float(os.getenv("VLLM_SR_SAFETY", "0.95")),
+        )
+        state_chars = (
+            int(os.environ["VLLM_SR_STATE_CHARS"]) if os.getenv("VLLM_SR_STATE_CHARS") else None
+        )
+        state_mode = os.getenv("VLLM_SR_STATE_MODE", "full")
+        max_questions_per_request = int(os.getenv("VLLM_SR_MAXQ", "64"))
+    else:
+        budget, keyring, state_chars, max_questions_per_request = None, None, None, 100
+        state_mode = "full"
     output = args.output_dir
     output.mkdir(parents=True, exist_ok=True)
     config = {
         "algorithm": "SAG2",
-        "provider": "OpenRouter",
+        "provider": "vLLM-SR (d3-turbo)" if _VLLM else "OpenRouter",
         "endpoint": ENDPOINT,
         "model": MODEL,
         "question_type": "noul",
         "jev_batching_policy": "sequential_candidate_batches_64000_tokens",
+        "transport": {
+            "vllm_sr": bool(_VLLM),
+            "tokens_per_minute": os.getenv("VLLM_SR_TOKENS_PER_MIN", limits["tokens_per_minute"]),
+            "requests_per_minute": os.getenv(
+                "VLLM_SR_REQUESTS_PER_MIN", limits["requests_per_minute"]
+            ),
+            "safety": os.getenv("VLLM_SR_SAFETY", "0.95"),
+            "max_questions_per_request": max_questions_per_request,
+            "state_chars": state_chars,
+            "state_mode": state_mode,
+            "max_inflight": int(os.getenv("VLLM_SR_MAX_INFLIGHT", "16")),
+            "model_limits": limits,
+        },
         "concurrency": args.concurrency,
         "parameters": PARAMETERS,
         "scope": "Official 500-question main set; 470 with recall labels; no answer generation",
+        "limit": args.limit,
         "question_types": dict(Counter(q["question_type"] for q in questions)),
         "question_file_sha256": corpus_fingerprint(source),
         "index_signature": build["index_signature"],
@@ -340,7 +431,7 @@ def main():
     report("running")
     with ThreadPoolExecutor(max_workers=args.concurrency) as executor:
         futures = {
-            executor.submit(run_question, q, build, shared, api_key, activity, output): q
+            executor.submit(run_question, q, build, shared, api_key, activity, output, budget, keyring, state_chars, state_mode, max_questions_per_request): q
             for q in eligible
             if q["question_id"] not in results
         }

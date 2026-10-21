@@ -43,6 +43,12 @@ from sag2 import (
     search_sag2,
 )
 from sample_identity import index_unique_records, validate_question_identity
+from sag2_vllm import (
+    DEFAULT_LIMITS,
+    MODEL_LIMITS,
+    TokenBudget,
+    VllmSrJevClient,
+)
 
 DATASETS = ("musique", "2wikimultihopqa", "hotpotqa")
 DATA_RELEASE = "5ec05b38deecc3318bb432c69865959c56058990"
@@ -534,11 +540,27 @@ async def run(args: argparse.Namespace) -> None:
         raise FileNotFoundError(f"Resume directory does not exist: {suite}")
     suite.mkdir(parents=True, exist_ok=True)
     load_dotenv(args.env_file)
-    args.jev_base_url = args.jev_base_url or os.getenv(
-        "JEV_BASE_URL", "https://openrouter.ai/api/alpha/decisions"
+    # Decision-model routing: prefer the new vLLM Semantic Router config (code/.env ->
+    # VLLM_SR_API / VLLM_SR_MODEL / VLLM_SR_KEY), falling back to the original
+    # JEV config (JEV_BASE_URL / JEV_MODEL / JEV_API_KEY / OPENROUTER_API_KEY) so the
+    # EXP-01 run (which points at the OpenRouter/localhost JEV) is unaffected.
+    # The vLLM-SR /v1/systemone endpoint speaks the same JEV "noul" protocol, so the
+    # existing JevClient works unchanged.
+    args.jev_base_url = (
+        args.jev_base_url
+        or os.getenv("VLLM_SR_API")
+        or os.getenv("JEV_BASE_URL", "https://openrouter.ai/api/alpha/decisions")
     )
-    args.jev_model = args.jev_model or os.getenv("JEV_MODEL", "typesafe/jev-1.13")
-    api_key = os.getenv("OPENROUTER_API_KEY") or os.getenv("JEV_API_KEY", "")
+    args.jev_model = (
+        args.jev_model
+        or os.getenv("VLLM_SR_MODEL")
+        or os.getenv("JEV_MODEL", "typesafe/jev-1.13")
+    )
+    api_key = (
+        os.getenv("VLLM_SR_KEY")
+        or os.getenv("OPENROUTER_API_KEY")
+        or os.getenv("JEV_API_KEY", "")
+    )
     args.jev_api_key = api_key
     if args.mode == "agentic":
         args.llm_config = {
@@ -570,18 +592,91 @@ async def run(args: argparse.Namespace) -> None:
         limit=args.concurrency,
         local_addr=(args.local_address, 0) if args.local_address else None,
     )
+    # Transport protocol record (kept OUT of config.json so that the resume
+    # fingerprint of already-running suites stays valid).
+    write_json(
+        suite / "transport.json",
+        {
+            "provider": "vLLM-SR" if os.getenv("VLLM_SR_API") else "JEV/OpenRouter",
+            "model": args.jev_model,
+            "endpoint": args.jev_base_url,
+            "tokens_per_minute": os.getenv("VLLM_SR_TOKENS_PER_MIN"),
+            "requests_per_minute": os.getenv("VLLM_SR_REQUESTS_PER_MIN"),
+            "aggregate_tokens_per_minute": os.getenv("VLLM_SR_AGGREGATE_TOKENS_PER_MIN"),
+            "api_keys": len(
+                [
+                    k
+                    for k in (
+                        api_key,
+                        os.getenv("VLLM_SR_KEY2"),
+                        os.getenv("VLLM_SR_KEY3"),
+                    )
+                    if k
+                ]
+            ),
+            "safety": os.getenv("VLLM_SR_SAFETY", "0.95"),
+            "max_questions_per_request": os.getenv("VLLM_SR_MAXQ"),
+            "state_chars": os.getenv("VLLM_SR_STATE_CHARS"),
+            "state_mode": os.getenv("VLLM_SR_STATE_MODE", "full"),
+            "max_inflight": os.getenv("VLLM_SR_MAX_INFLIGHT", "16"),
+            "model_limits": MODEL_LIMITS.get(args.jev_model, DEFAULT_LIMITS),
+        },
+    )
     async with aiohttp.ClientSession(
         connector=connector, timeout=aiohttp.ClientTimeout(total=args.timeout)
     ) as session:
-        client = (
-            local_model
-            if args.mode == "local"
-            else JevClient(
+        vllm_client = None
+        if os.getenv("VLLM_SR_API"):
+            # vLLM-SR meters input TOKENS per minute per key per model (docs: rate-limits),
+            # so the client paces on tokens, not requests, and shapes each request to the
+            # provider's own size formula. See scripts/sag2_vllm.py.
+            limits = MODEL_LIMITS.get(args.jev_model, DEFAULT_LIMITS)
+            vllm_keys = [
+                k
+                for k in (api_key, os.getenv("VLLM_SR_KEY2"), os.getenv("VLLM_SR_KEY3"))
+                if k
+            ]
+            vllm_client = VllmSrJevClient(
                 session,
                 args.jev_base_url,
                 args.jev_model,
                 api_key,
                 question_type=args.jev_question_type,
+                api_keys=vllm_keys,
+                tokens_per_minute=float(
+                    os.getenv("VLLM_SR_TOKENS_PER_MIN", limits["tokens_per_minute"])
+                ),
+                requests_per_minute=float(
+                    os.getenv("VLLM_SR_REQUESTS_PER_MIN", limits["requests_per_minute"])
+                ),
+                aggregate_tokens_per_minute=(
+                    float(os.environ["VLLM_SR_AGGREGATE_TOKENS_PER_MIN"])
+                    if os.getenv("VLLM_SR_AGGREGATE_TOKENS_PER_MIN")
+                    else None
+                ),
+                state_chars=(
+                    int(os.environ["VLLM_SR_STATE_CHARS"])
+                    if os.getenv("VLLM_SR_STATE_CHARS")
+                    else None
+                ),
+                state_mode=os.getenv("VLLM_SR_STATE_MODE", "full"),
+                max_inflight=int(os.getenv("VLLM_SR_MAX_INFLIGHT", "16")),
+                max_questions_per_request=int(os.getenv("VLLM_SR_MAXQ", "64")),
+            )
+        client = (
+            local_model
+            if args.mode == "local"
+            else (
+                vllm_client
+                or JevClient(
+                    session,
+                    args.jev_base_url,
+                    args.jev_model,
+                    api_key,
+                    question_type=args.jev_question_type,
+                    max_questions_per_request=100,
+                    requests_per_minute=0,
+                )
             )
         )
         for name in names:

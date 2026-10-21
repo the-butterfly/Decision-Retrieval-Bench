@@ -753,6 +753,38 @@ class CorpusIndex:
         return hits, queries
 
 
+class _TokenBucket:
+    """Async token-bucket rate limiter.
+
+    Paces actual HTTP sends so the client honours a provider's requests-per-minute
+    ceiling (and burst cap) even when many coroutines run concurrently. Used for
+    endpoints such as vLLM Semantic Router that enforce a real RPM limit and emit
+    HTTP 429 otherwise. `rate` is tokens/sec; `capacity` is the max burst.
+    """
+
+    def __init__(self, rate: float, capacity: float):
+        self.rate = float(rate)
+        self.capacity = float(capacity)
+        self.tokens = self.capacity
+        self.updated = time.monotonic()
+        self._lock = asyncio.Lock()
+
+    async def acquire(self, n: int = 1) -> None:
+        if self.rate <= 0:
+            return
+        async with self._lock:
+            now = time.monotonic()
+            self.tokens = min(self.capacity, self.tokens + (now - self.updated) * self.rate)
+            self.updated = now
+            while self.tokens < n:
+                wait = (n - self.tokens) / self.rate
+                await asyncio.sleep(wait)
+                now = time.monotonic()
+                self.tokens = min(self.capacity, self.tokens + (now - self.updated) * self.rate)
+                self.updated = now
+            self.tokens -= n
+
+
 class JevClient:
     def __init__(
         self,
@@ -762,6 +794,8 @@ class JevClient:
         api_key: str,
         *,
         question_type: str = "noul",
+        max_questions_per_request: int = 100,
+        requests_per_minute: float = 0,
     ):
         self.session, self.endpoint, self.model, self.api_key = (
             session,
@@ -775,25 +809,61 @@ class JevClient:
         if question_type != "noul":
             raise ValueError("SAG2 uses the noul question type")
         self.question_type = question_type
+        # Some decision endpoints (e.g. vLLM Semantic Router) cap the number of
+        # questions per request (64 for d3-turbo). Batch-split on this limit in
+        # addition to the token budget so candidate_k=100 still scores fully.
+        self.max_questions_per_request = max_questions_per_request
+        # Global RPM limiter (0 = disabled, for the original JEV endpoint which has
+        # no such cap). vLLM-SR enforces a real ceiling, so we pace every send.
+        self.rate_limiter = (
+            _TokenBucket(
+                requests_per_minute / 60.0,
+                min(8.0, max(1.0, (requests_per_minute / 60.0) * 4.0)),
+            )
+            if requests_per_minute and requests_per_minute > 0
+            else None
+        )
 
     async def request(self, payload: dict) -> dict:
         failures = Counter()
-        attempt, limited_retries = 0, 0
+        attempt, limited_retries, rate_retries = 0, 0, 0
         while True:
             attempt += 1
+            if attempt > 120:
+                # Hard guard against an effectively-dead endpoint (would otherwise
+                # loop forever under sustained errors). 120 attempts is far beyond
+                # any legitimate transient-throttling window.
+                raise RuntimeError(
+                    f"JevClient exceeded 120 attempts without a successful response "
+                    f"(failures={dict(failures)}); endpoint appears unavailable"
+                )
+            if self.rate_limiter is not None:
+                await self.rate_limiter.acquire()
+            status = None
+            retry_after = None
             try:
                 async with self.session.post(
                     self.endpoint, json=payload, headers={"Authorization": f"Bearer {self.api_key}"}
                 ) as response:
-                    if (
-                        response.status == 499
-                        or response.status in (408, 429, 500, 502, 503, 504)
-                        and limited_retries < 3
-                    ):
-                        failures[f"http_{response.status}"] += 1
+                    status = response.status
+                    retry_after = response.headers.get("Retry-After")
+                    if status in (408, 429, 499, 500, 502, 503, 504):
+                        failures[f"http_{status}"] += 1
                         await response.read()
-                        if response.status != 499:
+                        if status == 429:
+                            # Rate limiting is transient by contract: the server asks
+                            # us to slow down (via Retry-After) and recovers. Never
+                            # crash the whole run on it. Cap retries high enough to
+                            # survive real throttling windows; only give up if a single
+                            # payload is refused >60 times (provider effectively down).
+                            if rate_retries >= 60:
+                                response.raise_for_status()
+                            rate_retries += 1
+                        elif status != 499:
+                            if limited_retries >= 3:
+                                response.raise_for_status()
                             limited_retries += 1
+                        # 499 (status==499) is retried indefinitely per server contract.
                     else:
                         response.raise_for_status()
                         data = await response.json()
@@ -803,10 +873,15 @@ class JevClient:
                         return data
             except (TimeoutError, aiohttp.ClientConnectionError) as error:
                 failures["timeout" if isinstance(error, TimeoutError) else "connection"] += 1
-                if limited_retries == 3:
+                if limited_retries >= 3:
                     raise
                 limited_retries += 1
             delay = min(30, 2 ** min(attempt - 1, 5))
+            if status == 429 and retry_after:
+                try:
+                    delay = max(delay, float(retry_after))
+                except ValueError:
+                    pass
             logging.warning(
                 "Jev request failed (%s); retry in %ss; no successful response counted",
                 dict(failures),
@@ -869,7 +944,7 @@ class JevClient:
                 raise ValueError(
                     f"Jev candidate {candidate['id']} exceeds 32000-token context budget ({state_tokens + tokens}); source text was not truncated"
                 )
-            if estimated + tokens > 64000:
+            if estimated + tokens > 64000 or len(questions) >= self.max_questions_per_request:
                 batches.append((questions, estimated))
                 questions, estimated = {}, state_tokens
             questions[f"candidate_{candidate['id']}"] = question
