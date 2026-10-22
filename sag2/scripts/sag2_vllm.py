@@ -600,16 +600,23 @@ class VllmSrJevClient(JevClient):
         questions = shaped.get("questions", {})
 
         # Never exceed the provider's per-request size: split instead of 400.
-        if estimate > self.limits["max_request_tokens"] and len(questions) > 1:
+        # `estimate` is the provider's own byte formula; split into as many pieces as
+        # needed (a single binary halving is not enough when one batch carries ~150 KB of
+        # CJK candidate text, as T2Ranking does), then recurse so each piece fits.
+        split_at = int(
+            self.limits["max_request_tokens"] * float(os.getenv("VLLM_SR_SPLIT_SAFETY", "0.88"))
+        )
+        if estimate > split_at and len(questions) > 1:
+            pieces = max(2, -(-estimate // split_at))  # ceil
             keys = list(questions)
-            middle = len(keys) // 2
-            halves = [keys[:middle], keys[middle:]]
+            size = -(-len(keys) // pieces)  # ceil
             self.stats["split_requests"] += 1
             merged = {"answers": {}, "usage": {"input_tokens": 0, "output_tokens": 0}, "model": self.model}
-            for chunk in halves:
+            for start in range(0, len(keys), size):
+                chunk = keys[start : start + size]
                 part = dict(shaped)
                 part["questions"] = {k: questions[k] for k in chunk}
-                result = await self._send(part)
+                result = await self.request(part)  # recursive: re-checks the size
                 merged["answers"].update(result.get("answers", {}))
                 merged["usage"]["input_tokens"] += result.get("usage", {}).get("input_tokens", 0)
                 merged["usage"]["output_tokens"] += result.get("usage", {}).get("output_tokens", 0)
@@ -619,7 +626,29 @@ class VllmSrJevClient(JevClient):
             merged["failed_attempts"] = {}
             return merged
 
-        return await self._send(shaped)
+        try:
+            return await self._send(shaped)
+        except aiohttp.ClientError as error:
+            # Safety net: if the provider still refuses the batch as too long (our byte
+            # estimate can drift on long CJK payloads), halve it and retry recursively.
+            if "request_too_long" not in str(error) or len(questions) < 2:
+                raise
+            keys = list(questions)
+            middle = len(keys) // 2
+            self.stats["split_requests"] += 1
+            merged = {"answers": {}, "usage": {"input_tokens": 0, "output_tokens": 0}, "model": self.model}
+            for chunk in (keys[:middle], keys[middle:]):
+                part = dict(shaped)
+                part["questions"] = {k: questions[k] for k in chunk}
+                result = await self.request(part)
+                merged["answers"].update(result.get("answers", {}))
+                merged["usage"]["input_tokens"] += result.get("usage", {}).get("input_tokens", 0)
+                merged["usage"]["output_tokens"] += result.get("usage", {}).get("output_tokens", 0)
+                merged["model"] = result.get("model", self.model)
+            merged["request_attempts"] = 1
+            merged["http_attempts"] = 1
+            merged["failed_attempts"] = {}
+            return merged
 
     async def _send(self, payload: dict) -> dict:
         # Pace on what the provider will actually bill, not on its size estimate.

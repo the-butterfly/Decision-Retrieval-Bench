@@ -54,6 +54,12 @@ DATASETS = ("musique", "2wikimultihopqa", "hotpotqa")
 DATA_RELEASE = "5ec05b38deecc3318bb432c69865959c56058990"
 
 
+def vllm_api_keys(primary: str | None) -> list[str]:
+    """All configured vLLM-SR keys: VLLM_SR_KEY, KEY2 ... KEY9 (order kept, deduped)."""
+    candidates = [primary] + [os.getenv(f"VLLM_SR_KEY{i}") for i in range(2, 10)]
+    return list(dict.fromkeys(key for key in candidates if key))
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mode", choices=["sag2", "agentic", "local"], default="sag2")
@@ -605,17 +611,7 @@ async def run(args: argparse.Namespace) -> None:
             "tokens_per_minute": os.getenv("VLLM_SR_TOKENS_PER_MIN"),
             "requests_per_minute": os.getenv("VLLM_SR_REQUESTS_PER_MIN"),
             "aggregate_tokens_per_minute": os.getenv("VLLM_SR_AGGREGATE_TOKENS_PER_MIN"),
-            "api_keys": len(
-                [
-                    k
-                    for k in (
-                        api_key,
-                        os.getenv("VLLM_SR_KEY2"),
-                        os.getenv("VLLM_SR_KEY3"),
-                    )
-                    if k
-                ]
-            ),
+            "api_keys": len(vllm_api_keys(api_key)),
             "safety": os.getenv("VLLM_SR_SAFETY", "0.95"),
             "max_questions_per_request": os.getenv("VLLM_SR_MAXQ"),
             "state_chars": os.getenv("VLLM_SR_STATE_CHARS"),
@@ -633,11 +629,7 @@ async def run(args: argparse.Namespace) -> None:
             # so the client paces on tokens, not requests, and shapes each request to the
             # provider's own size formula. See scripts/sag2_vllm.py.
             limits = MODEL_LIMITS.get(args.jev_model, DEFAULT_LIMITS)
-            vllm_keys = [
-                k
-                for k in (api_key, os.getenv("VLLM_SR_KEY2"), os.getenv("VLLM_SR_KEY3"))
-                if k
-            ]
+            vllm_keys = vllm_api_keys(api_key)
             vllm_client = VllmSrJevClient(
                 session,
                 args.jev_base_url,
