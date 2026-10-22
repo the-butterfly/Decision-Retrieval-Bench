@@ -75,7 +75,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--dataset",
         nargs="+",
         default=["all"],
-        choices=["all", *DATASETS],
+        # Any {name}.json + {name}_corpus.json pair in --dataset-dir works;
+        # "all" still means the three paper datasets only.
+        metavar="NAME",
     )
     parser.add_argument("--dataset-dir", type=Path, default=ROOT / "dataset")
     parser.add_argument(
