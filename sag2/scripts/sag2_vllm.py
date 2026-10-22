@@ -29,16 +29,178 @@ per-question enterprise runner uses one event loop per thread, where an
 from __future__ import annotations
 
 import asyncio
+import atexit
+import hashlib
 import json
+import os
 import random
+import threading
 import time
 import unicodedata
 from collections import Counter
+from pathlib import Path
 from threading import Lock, Semaphore
 
 import aiohttp
 
 from sag2 import JevClient, compact_json
+
+
+class RateLimitTelemetry:
+    """Record the provider's own rate-limit signals while a run is in flight.
+
+    Enabled by `VLLM_SR_TELEMETRY=<path>.jsonl`; writes one JSON line per HTTP
+    attempt (status, error code, Retry-After, `X-RateLimit-*` headers, latency,
+    paced tokens) and a summary to `<path>.summary.json` (refreshed every 200
+    events and at exit, so a killed run still leaves numbers behind).
+
+    One instance per process, shared by every client: the enterprise runner
+    creates one client per question, each on its own event loop/thread, so the
+    counters must be module-level and lock-guarded.
+    """
+
+    def __init__(self, path: str | None):
+        self.path = Path(path) if path else None
+        self.summary_path = Path(str(self.path) + ".summary.json") if self.path else None
+        # RLock: flush() calls summary(), which takes the same lock.
+        self.lock = threading.RLock()
+        self.since = time.time()
+        self.events = 0
+        self.pending: list[str] = []
+        self.statuses: Counter = Counter()
+        self.codes: Counter = Counter()
+        self.keys: Counter = Counter()
+        self.min_remaining_tokens: int | None = None
+        self.min_remaining_requests: int | None = None
+        self.latencies: list[float] = []
+        self.billed_tokens = 0
+        self.waited_seconds = 0.0
+        self.retry_after_seconds = 0.0
+        if self.path:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            atexit.register(self.flush, True)
+
+    @staticmethod
+    def key_id(key: str) -> str:
+        return hashlib.sha1(key.encode()).hexdigest()[:6]
+
+    def note_wait(self, seconds: float) -> None:
+        if not self.path or seconds <= 0:
+            return
+        with self.lock:
+            self.waited_seconds += seconds
+
+    def record(
+        self,
+        *,
+        model: str,
+        key: str | None,
+        status: int,
+        code: str,
+        headers,
+        latency: float,
+        billed_tokens: int,
+        attempt: int,
+        retry_after: float | None = None,
+    ) -> None:
+        if not self.path:
+            return
+        def as_int(name):
+            try:
+                return int(headers.get(name))  # type: ignore[union-attr]
+            except (TypeError, ValueError):
+                return None
+        limit_t = as_int("X-RateLimit-Limit-Tokens")
+        rem_t = as_int("X-RateLimit-Remaining-Tokens")
+        limit_r = as_int("X-RateLimit-Limit-Requests")
+        rem_r = as_int("X-RateLimit-Remaining-Requests")
+        reset = as_int("X-RateLimit-Reset")
+        event = {
+            "ts": round(time.time(), 3),
+            "model": model,
+            "key": self.key_id(key) if key else None,
+            "status": status,
+            "code": code or None,
+            "attempt": attempt,
+            "retry_after": retry_after,
+            "reset_s": reset,
+            "limit_tokens": limit_t,
+            "remaining_tokens": rem_t,
+            "limit_requests": limit_r,
+            "remaining_requests": rem_r,
+            "latency_ms": round(latency * 1000, 1),
+            "billed_tokens": billed_tokens,
+        }
+        with self.lock:
+            self.events += 1
+            self.statuses[str(status)] += 1
+            if code:
+                self.codes[code] += 1
+            if key:
+                self.keys[event["key"]] += 1
+            if rem_t is not None and (self.min_remaining_tokens is None or rem_t < self.min_remaining_tokens):
+                self.min_remaining_tokens = rem_t
+            if rem_r is not None and (self.min_remaining_requests is None or rem_r < self.min_remaining_requests):
+                self.min_remaining_requests = rem_r
+            self.latencies.append(latency)
+            if status == 200:
+                self.billed_tokens += billed_tokens
+            if retry_after:
+                self.retry_after_seconds += retry_after
+            self.pending.append(json.dumps(event, ensure_ascii=False))
+            if len(self.pending) >= 25:
+                self._flush_locked()
+        if self.events % 200 == 0:
+            self.flush(False)
+
+    def _flush_locked(self) -> None:
+        if not self.path or not self.pending:
+            return
+        try:
+            with self.path.open("a", encoding="utf-8") as stream:
+                stream.write("\n".join(self.pending) + "\n")
+        except OSError:
+            pass
+        self.pending.clear()
+
+    def summary(self) -> dict:
+        with self.lock:
+            latency = sorted(self.latencies)
+            n = len(latency)
+            def pct(q):
+                return round(latency[min(n - 1, int(n * q))] * 1000, 1) if n else None
+            total = sum(self.statuses.values())
+            return {
+                "window_seconds": round(time.time() - self.since, 1),
+                "http_attempts": total,
+                "statuses": dict(self.statuses),
+                "error_codes": dict(self.codes),
+                "rate_429_share": round(self.statuses.get("429", 0) / total, 4) if total else None,
+                "keys": dict(self.keys),
+                "min_remaining_tokens_seen": self.min_remaining_tokens,
+                "min_remaining_requests_seen": self.min_remaining_requests,
+                "latency_ms_p50": pct(0.50),
+                "latency_ms_p95": pct(0.95),
+                "latency_ms_max": pct(1.0),
+                "billed_tokens": self.billed_tokens,
+                "pacing_wait_seconds": round(self.waited_seconds, 1),
+                "retry_after_seconds": round(self.retry_after_seconds, 1),
+            }
+
+    def flush(self, final: bool = False) -> None:
+        if not self.path:
+            return
+        with self.lock:
+            self._flush_locked()
+            try:
+                self.summary_path.write_text(  # type: ignore[union-attr]
+                    json.dumps(self.summary(), ensure_ascii=False, indent=2) + "\n"
+                )
+            except OSError:
+                pass
+
+
+TELEMETRY = RateLimitTelemetry(os.environ.get("VLLM_SR_TELEMETRY"))
 
 # Per-key, per-model budgets and per-request limits (docs + /api/info, 2026-10-21).
 MODEL_LIMITS = {
@@ -91,6 +253,14 @@ DEFAULT_LIMITS = {
 # deliberately conservative byte estimate and is ~4-17x larger than what it
 # actually bills - it must size requests, never pace them.
 PROVIDER_TOKEN_RATIO = 0.826
+
+
+def _as_float(value) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
 
 
 def _bytes(text: str) -> int:
@@ -455,6 +625,7 @@ class VllmSrJevClient(JevClient):
         # Pace on what the provider will actually bill, not on its size estimate.
         tokens = self.billing_tokens(payload)
         entry = None
+        paced_at = time.perf_counter()
         if self.keyring is not None:
             entry = self.keyring.pick()
             await entry["budget"].acquire_async(tokens, 1.0)
@@ -464,6 +635,7 @@ class VllmSrJevClient(JevClient):
         else:
             await self.budget.acquire_async(tokens, 1.0)
             key = self.api_key
+        TELEMETRY.note_wait(time.perf_counter() - paced_at)
         while not self._inflight.acquire(blocking=False):
             await asyncio.sleep(0.1)
         try:
@@ -483,6 +655,7 @@ class VllmSrJevClient(JevClient):
                 )
             status = None
             retry_after = None
+            started = time.perf_counter()
             try:
                 async with self.session.post(
                     self.endpoint,
@@ -491,12 +664,24 @@ class VllmSrJevClient(JevClient):
                 ) as response:
                     status = response.status
                     retry_after = response.headers.get("Retry-After")
+                    # keep the CIMultiDict: header names are case-insensitive
+                    headers = response.headers
                     if self.keyring is not None and entry is not None:
                         self.keyring.observe(entry, response.headers)
                     else:
                         self.budget.observe(response.headers)
                     if status == 200:
                         data = await response.json()
+                        TELEMETRY.record(
+                            model=self.model,
+                            key=key,
+                            status=200,
+                            code="",
+                            headers=headers,
+                            latency=time.perf_counter() - started,
+                            billed_tokens=int((data.get("usage") or {}).get("input_tokens") or 0),
+                            attempt=attempt,
+                        )
                         data["request_attempts"] = 1
                         data["http_attempts"] = attempt
                         data["failed_attempts"] = dict(failures)
@@ -504,6 +689,17 @@ class VllmSrJevClient(JevClient):
                         return data
                     body = await response.text()
                     code = self._error_code(body)
+                    TELEMETRY.record(
+                        model=self.model,
+                        key=key,
+                        status=status,
+                        code=code,
+                        headers=headers,
+                        latency=time.perf_counter() - started,
+                        billed_tokens=0,
+                        attempt=attempt,
+                        retry_after=_as_float(retry_after),
+                    )
                     if status == 422:
                         # One invalid question fails the whole request on /v1/systemone.
                         self.stats["422_question_failed"] += 1
