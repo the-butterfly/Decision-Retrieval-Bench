@@ -13,6 +13,7 @@ import struct
 import threading
 import time
 import unicodedata
+import os
 from collections import Counter, OrderedDict, defaultdict
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from contextlib import nullcontext
@@ -813,6 +814,12 @@ class JevClient:
         # questions per request (64 for d3-turbo). Batch-split on this limit in
         # addition to the token budget so candidate_k=100 still scores fully.
         self.max_questions_per_request = max_questions_per_request
+        # Context budgets from the original JEV backend (typesafe/jev-1.13):
+        # 32k for state + one candidate, 64k per request. The vLLM-SR d3-*
+        # backends allow 131,072 tokens per request, so these are overridable
+        # via env without touching the default (paper-faithful) behaviour.
+        self.context_budget = int(os.environ.get("SAG2_JEV_CONTEXT_TOKENS", "32000"))
+        self.request_budget = int(os.environ.get("SAG2_JEV_REQUEST_TOKENS", "64000"))
         # Global RPM limiter (0 = disabled, for the original JEV endpoint which has
         # no such cap). vLLM-SR enforces a real ceiling, so we pace every send.
         self.rate_limiter = (
@@ -940,11 +947,11 @@ class JevClient:
             if candidate.get("heading"):
                 question["instructions"]["candidate_heading"] = candidate["heading"]
             tokens = len(self.encoding.encode(compact_json(question), disallowed_special=())) + 64
-            if state_tokens + tokens > 32000:
+            if state_tokens + tokens > self.context_budget:
                 raise ValueError(
-                    f"Jev candidate {candidate['id']} exceeds 32000-token context budget ({state_tokens + tokens}); source text was not truncated"
+                    f"Jev candidate {candidate['id']} exceeds {self.context_budget}-token context budget ({state_tokens + tokens}); source text was not truncated"
                 )
-            if estimated + tokens > 64000 or len(questions) >= self.max_questions_per_request:
+            if estimated + tokens > self.request_budget or len(questions) >= self.max_questions_per_request:
                 batches.append((questions, estimated))
                 questions, estimated = {}, state_tokens
             questions[f"candidate_{candidate['id']}"] = question
