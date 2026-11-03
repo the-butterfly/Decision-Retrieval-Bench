@@ -64,6 +64,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mode", choices=["sag2", "agentic", "local"], default="sag2")
     parser.add_argument(
+        "--final-rerank",
+        choices=["dpp", "choice", "none"],
+        default="dpp",
+        help="final ranking: dpp (original), choice (DecisionRAG multiple-choice over "
+             "the top --choice-top candidates), or none (leave ranked() order)",
+    )
+    parser.add_argument("--choice-top", type=int, default=20, help="shortlist size for --final-rerank choice")
+    parser.add_argument("--choice-chars", type=int, default=2200, help="chars per candidate in the choice context")
+    parser.add_argument(
         "--model-path", type=Path, help="Local reranker directory; no downloads at runtime"
     )
     parser.add_argument("--reranker", choices=["jina", "qwen"], default="qwen")
@@ -213,6 +222,49 @@ def write_json(path: Path, value: object) -> None:
     temporary = path.with_suffix(".tmp")
     temporary.write_text(compact_json(value), encoding="utf-8")
     temporary.replace(path)
+
+
+async def choice_rerank(scorer, question: str, candidates: list[dict], top: int, chars: int) -> list[dict]:
+    """DecisionRAG §B.6: one multiple-choice judgement over the top `top` candidates.
+
+    The shortlist is reordered by the choice probabilities; everything below keeps its
+    binary order.  Used by --final-rerank choice, which replaces SAG2's DPP step.
+    """
+    shortlist = candidates[:top]
+    if len(shortlist) < 2:
+        return candidates
+    state = json.dumps(
+        {
+            "original_question": question,
+            "previously_retrieved_evidence": [
+                {
+                    "passage_id": f"c{c['id']}",
+                    "title": c.get("title") or "",
+                    "passage": (c.get("content") or "")[:chars],
+                }
+                for c in shortlist
+            ],
+        },
+        ensure_ascii=False,
+    )
+    payload = {
+        "model": scorer.model,
+        "state": state,
+        "questions": {
+            "rerank": {
+                "type": "choice",
+                "instructions": {
+                    "question": "Which passage should the answer be based on to answer original_question?"
+                },
+                "criteria": {f"c{c['id']}": f"Passage c{c['id']}" for c in shortlist},
+            }
+        },
+    }
+    data = await scorer.request(payload)
+    probabilities = (data.get("answers") or {}).get("rerank", {}).get("probabilities") or {}
+    head = sorted(shortlist, key=lambda c: -float(probabilities.get(f"c{c['id']}", 0.0)))
+    chosen = {id(c) for c in head}
+    return head + [c for c in candidates if id(c) not in chosen]
 
 
 async def run_dataset(
@@ -388,6 +440,21 @@ async def run_dataset(
                             max_hops=config["max_hops"],
                             expansion_term_limit=args.expansion_term_limit,
                         )
+                        if args.final_rerank != "dpp":
+                            # rebuild ranked() order from the last jev trace, then re-rank
+                            scored = [s["id"] for s in result["trace"][-1]["scores"]]
+                            cand_by_id = {c["id"]: c for c in result["candidates"]}
+                            base = [cand_by_id[i] for i in scored if i in cand_by_id]
+                            if args.final_rerank == "none":
+                                result["candidates"] = base
+                            else:
+                                result["candidates"] = await choice_rerank(
+                                    scorer,
+                                    record["question"],
+                                    base,
+                                    args.choice_top,
+                                    args.choice_chars,
+                                )
                         if args.mode == "local":
                             result["algorithm"] = "Local SAG2"
                             result["reranker_usage"] = result.pop("jev_usage")
@@ -608,6 +675,9 @@ async def run(args: argparse.Namespace) -> None:
             "provider": "vLLM-SR" if os.getenv("VLLM_SR_API") else "JEV/OpenRouter",
             "model": args.jev_model,
             "endpoint": args.jev_base_url,
+            "final_rerank": args.final_rerank,
+            "choice_top": args.choice_top if args.final_rerank == "choice" else None,
+            "choice_chars": args.choice_chars if args.final_rerank == "choice" else None,
             "tokens_per_minute": os.getenv("VLLM_SR_TOKENS_PER_MIN"),
             "requests_per_minute": os.getenv("VLLM_SR_REQUESTS_PER_MIN"),
             "aggregate_tokens_per_minute": os.getenv("VLLM_SR_AGGREGATE_TOKENS_PER_MIN"),
